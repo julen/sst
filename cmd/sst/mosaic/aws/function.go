@@ -18,6 +18,7 @@ import (
 	"github.com/sst/sst/v3/cmd/sst/mosaic/aws/bridge"
 	"github.com/sst/sst/v3/cmd/sst/mosaic/watcher"
 	"github.com/sst/sst/v3/pkg/bus"
+	"github.com/sst/sst/v3/pkg/events"
 	"github.com/sst/sst/v3/pkg/project"
 	"github.com/sst/sst/v3/pkg/runtime"
 	"github.com/sst/sst/v3/pkg/server"
@@ -50,6 +51,9 @@ type FunctionBuildEvent struct {
 	FunctionID string
 	Errors     []string
 }
+
+// Use the common FunctionBuildProgressEvent from events package
+type FunctionBuildProgressEvent = events.FunctionBuildProgressEvent
 
 type FunctionLogEvent struct {
 	FunctionID string
@@ -362,8 +366,23 @@ func function(ctx context.Context, input input) {
 					info.Worker.Stop()
 				}
 				builds = map[string]*runtime.BuildOutput{}
+				// Restart workers based on runtime's ShouldRunEagerly preference.
+				// Runtimes like Python return false to enable lazy startup - workers
+				// will restart on-demand when invoked instead of all at once.
+				// This prevents the "startup storm" when 50+ Python functions would
+				// otherwise all restart simultaneously after an infrastructure change.
 				for workerID, info := range workers {
-					run(info.FunctionID, workerID)
+					target, ok := targets[info.FunctionID]
+					if !ok {
+						continue
+					}
+					if input.project.Runtime.ShouldRunEagerly(target.Runtime) {
+						run(info.FunctionID, workerID)
+					} else {
+						// Lazy startup: delete worker so it restarts on next invoke (MessageInit)
+						log.Info("lazy startup: deferring worker restart until invoked", "workerID", workerID, "functionID", info.FunctionID)
+						delete(workers, workerID)
+					}
 				}
 			case *runtime.BuildInput:
 				targets[evt.FunctionID] = evt
@@ -397,7 +416,22 @@ func function(ctx context.Context, input input) {
 
 				for workerID, info := range workers {
 					if toBuild[info.FunctionID] {
-						run(info.FunctionID, workerID)
+						// Check if this runtime wants eager or lazy worker startup.
+						// Runtimes like Python return false to enable lazy startup - workers
+						// will restart on-demand when invoked instead of all at once.
+						// This prevents the "startup storm" when 50+ Python functions would
+						// otherwise all restart simultaneously after a shared file change.
+						target, ok := targets[info.FunctionID]
+						if !ok {
+							continue
+						}
+						if input.project.Runtime.ShouldRunEagerly(target.Runtime) {
+							run(info.FunctionID, workerID)
+						} else {
+							// Lazy startup: delete worker so it restarts on next invoke (MessageInit)
+							log.Info("lazy startup: deferring worker restart until invoked", "workerID", workerID, "functionID", info.FunctionID)
+							delete(workers, workerID)
+						}
 					}
 				}
 				break

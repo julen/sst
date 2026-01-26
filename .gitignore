@@ -13,3 +13,9 @@ Pulumi.yaml
 tmp
 .termai
 .opencode
+.idea
+.kiro
+
+#Python
+__pycache__
+sst
